@@ -14,7 +14,8 @@ on:
         type: boolean
         default: true
   schedule:
-    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+    # Days 1, 7, 13, 19, 25, 31 at 09:00 UTC: never more than 6 days apart, inside GitHub's 7-day cache eviction.
+    - cron: "0 9 */6 * *"
 
 permissions:
   contents: read
