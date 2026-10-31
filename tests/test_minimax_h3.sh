@@ -86,6 +86,16 @@ else
   echo "FAIL: non-/32 canvas returned $code ($(head -c 120 /tmp/h3_dims.json))"; rc=1
 fi
 
+for bad in '"knots":[1,0.5,0.6,0]' '"sampler":"heun"'; do
+  code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d "{\"prompt\":\"x\",$bad}" -o /tmp/h3_sched.json -w "%{http_code}")
+  if [ "$code" = "400" ] && grep -qE "'knots'|'sampler'" /tmp/h3_sched.json; then
+    echo "PASS: $bad -> named 400"
+  else
+    echo "FAIL: $bad returned $code ($(head -c 120 /tmp/h3_sched.json))"; rc=1
+  fi
+done
+
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d '{"messages":[{"role":"user","content":"hi"}]}' -o /tmp/h3_chat.json -w "%{http_code}")
 if [ "$code" = "400" ] && grep -q "video generation model" /tmp/h3_chat.json; then
@@ -127,6 +137,18 @@ assert abs(adur - vdur) < 0.06, f"audio {adur:.3f}s vs video {vdur:.3f}s"
 print(f"PASS: generation -> {F}f {W}x{H} rgb8 range {lo}..{hi}, audio {adur:.3f}s @{sr}Hz stereo")
 PY
   [ $? -eq 0 ] || rc=1
+fi
+
+# [3b] Pika H3 Flex's ladder: explicit knots + the renoise sampler, engaged by the log and on the knot sigmas.
+OUT=/tmp/test_minimax_h3_renoise.json
+code=$(curl -s --max-time 900 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"a calico cat blinking on a sunlit windowsill. overall_soundscape: soft rain.","num_frames":5,"width":64,"height":64,"knots":[1,0.75,0.5,0.25,0.1,0.04,0],"sampler":"renoise","seed":7}' \
+  -o "$OUT" -w "%{http_code}")
+if [ "$code" = "200" ] && grep -q "schedule: 7 knots, sampler renoise" "$LOG" && grep -q "step 2/6 sigma 0.9730" "$LOG" \
+  && python3 -c "import json,sys; d=json.load(open('$OUT')); sys.exit(0 if d['frames']==5 and d.get('audio_data') else 1)"; then
+  echo "PASS: renoise over Pika's knots -> 5 frames + audio, schedule logged, step 2 at sigma 0.9730"
+else
+  echo "FAIL: renoise generation http $code ($(head -c 160 "$OUT"))"; rc=1
 fi
 
 # The staged bill above is a claim about a runtime nobody can check unless each

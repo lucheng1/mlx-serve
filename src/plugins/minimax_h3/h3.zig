@@ -3287,6 +3287,34 @@ pub fn sigmaSchedule(allocator: std.mem.Allocator, steps: u32, shift: f64) ![]f6
     return out;
 }
 
+/// `sigmaSchedule` for explicit base-grid knots. Caller owns the returned slice.
+pub fn knotSigmas(allocator: std.mem.Allocator, knots: []const f64, shift: f64) ![]f64 {
+    const out = try allocator.alloc(f64, knots.len);
+    for (out, knots) |*o, b| o.* = timeShiftSigma(b, 1.0, shift);
+    return out;
+}
+
+/// One stream's re-noising step: the clean estimate `x - x0_scale·v`, carried to `sigma_next` with `noise`
+/// (returned as is at 0). `x0_scale` is sigma on the stream's own clock over the slope its velocity carries.
+fn renoiseStep(x: mlx.mlx_array, v: mlx.mlx_array, x0_scale: f64, sigma_next: f64, noise: ?mlx.mlx_array, s: S) !mlx.mlx_array {
+    const k = try scalarLike(@floatCast(x0_scale), v, s);
+    defer _ = mlx.mlx_array_free(k);
+    const kv = try mulA(v, k, s);
+    defer _ = mlx.mlx_array_free(kv);
+    const x0 = try subA(x, kv, s);
+    if (sigma_next == 0) return x0;
+    defer _ = mlx.mlx_array_free(x0);
+    const keep = try scalarLike(@floatCast(1.0 - sigma_next), x0, s);
+    defer _ = mlx.mlx_array_free(keep);
+    const kept = try mulA(x0, keep, s);
+    defer _ = mlx.mlx_array_free(kept);
+    const amt = try scalarLike(@floatCast(sigma_next), noise.?, s);
+    defer _ = mlx.mlx_array_free(amt);
+    const fresh = try mulA(noise.?, amt, s);
+    defer _ = mlx.mlx_array_free(fresh);
+    return addA(kept, fresh, s);
+}
+
 /// A FastH3 PDD student (FastVideo `fastvideo/layers/pdd.py`): its output heads
 /// are `grid` stacked heads, one per interval of a fine grid on the base clock
 /// [0, max_t], and a step between two trained nodes runs their
@@ -3454,6 +3482,11 @@ pub const GenRequest = struct {
     /// Requested source frames; snapped UP to the 17k+5 ladder.
     frames: u32 = 56,
     steps: u32 = 30,
+    /// Base-grid noise levels `[1, ..., 0]` (steps + 1 of them) in place of the uniform grid; both clocks shift them.
+    knots: ?[]const f64 = null,
+    /// Pika H3 Flex's sampler: each step predicts the clean latent and re-noises it to the next level with fresh
+    /// noise, per stream on its own clock, instead of an Euler step.
+    renoise: bool = false,
     seed: u64 = 0,
     shift_video: f64 = SIGMA_SHIFT_VIDEO,
     shift_audio: f64 = SIGMA_SHIFT_AUDIO,
@@ -4208,7 +4241,13 @@ fn generateOne(
     defer _ = mlx.mlx_array_free(audio_x);
 
     const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
-    const sigmas = if (req.pdd) |*p| try p.sigmas(allocator, req.shift_video) else try sigmaSchedule(allocator, req.steps, req.shift_video);
+    const sigmas = if (req.pdd) |*p|
+        try p.sigmas(allocator, req.shift_video)
+    else if (req.knots) |k|
+        try knotSigmas(allocator, k, req.shift_video)
+    else
+        try sigmaSchedule(allocator, req.steps, req.shift_video);
+    if (req.knots != null or req.renoise) log.info("[minimax-h3] schedule: {d} knots, sampler {s}\n", .{ sigmas.len, if (req.renoise) "renoise" else "euler" });
     defer allocator.free(sigmas);
     if (req.pdd) |p| log.info("[minimax-h3] PDD student: {d} fused blocks over {d} heads, max_t {d}\n", .{ p.steps(), p.grid, p.max_t });
     // A PDD student starts at its first node's noise level, max_t on both clocks.
@@ -4458,21 +4497,43 @@ fn generateOne(
             // turbo, where the audio advance is the EXACT mapped Δσa
             // (`audioStepFactor`): at 4-8 steps the first-order form
             // over-steps the audio clock by up to 2.5x on the last leg.
-            const dv = try scalarLike(@floatCast(dsigma), out.video, s);
-            defer _ = mlx.mlx_array_free(dv);
-            const stepv = try mulA(out.video, dv, s);
-            defer _ = mlx.mlx_array_free(stepv);
-            const nv = try addA(video_x, stepv, s);
-            _ = mlx.mlx_array_free(video_x);
-            video_x = nv;
+            if (req.renoise) {
+                // The audio velocity carries d(sigma_a)/d(sigma_v): its clean estimate divides that back out.
+                const next = sigmas[i + 1];
+                const sa = timeShiftSigma(sigma, req.shift_video, req.shift_audio);
+                const slope = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
+                const noise_seed = req.seed +% (@as(u64, 1) << 32) +% 2 * @as(u64, @intCast(i));
+                const vn: ?mlx.mlx_array = if (next > 0) try randomNormal(mlx.getShape(video_x), noise_seed, mlx.mlx_dtype.float32, s) else null;
+                defer if (vn) |n| {
+                    _ = mlx.mlx_array_free(n);
+                };
+                const an: ?mlx.mlx_array = if (next > 0) try randomNormal(mlx.getShape(audio_x), noise_seed +% 1, mlx.mlx_dtype.float32, s) else null;
+                defer if (an) |n| {
+                    _ = mlx.mlx_array_free(n);
+                };
+                const nv = try renoiseStep(video_x, out.video, sigma, next, vn, s);
+                _ = mlx.mlx_array_free(video_x);
+                video_x = nv;
+                const na = try renoiseStep(audio_x, out.audio, sa / slope, timeShiftSigma(next, req.shift_video, req.shift_audio), an, s);
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = na;
+            } else {
+                const dv = try scalarLike(@floatCast(dsigma), out.video, s);
+                defer _ = mlx.mlx_array_free(dv);
+                const stepv = try mulA(out.video, dv, s);
+                defer _ = mlx.mlx_array_free(stepv);
+                const nv = try addA(video_x, stepv, s);
+                _ = mlx.mlx_array_free(video_x);
+                video_x = nv;
 
-            const da = try scalarLike(@floatCast(max_t * audioStepFactor(req.turbo or req.pdd != null, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
-            defer _ = mlx.mlx_array_free(da);
-            const stepa = try mulA(out.audio, da, s);
-            defer _ = mlx.mlx_array_free(stepa);
-            const na = try addA(audio_x, stepa, s);
-            _ = mlx.mlx_array_free(audio_x);
-            audio_x = na;
+                const da = try scalarLike(@floatCast(max_t * audioStepFactor(req.turbo or req.pdd != null, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
+                defer _ = mlx.mlx_array_free(da);
+                const stepa = try mulA(out.audio, da, s);
+                defer _ = mlx.mlx_array_free(stepa);
+                const na = try addA(audio_x, stepa, s);
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = na;
+            }
 
             if (sc_thresh > 0) {
                 const slope_f = cachedAudioSlope(sigma, max_t, req.shift_video, req.shift_audio);
@@ -5285,6 +5346,51 @@ test "minimax h3: schedule t-set collects every step's unique timesteps" {
         defer p.deinit();
         for (p.runs) |r| try testing.expect(r.mod_row / 3 < ts.len);
     }
+}
+
+test "minimax h3: explicit knots map to Pika H3 Flex's video and audio ladders; uniform knots are the default schedule" {
+    const a = testing.allocator;
+    const v = try knotSigmas(a, &.{ 1.0, 0.75, 0.5, 0.25, 0.1, 0.04, 0.0 }, 12.0);
+    defer a.free(v);
+    for (v, [_]f64{ 1.0, 0.972973, 0.923077, 0.8, 0.571429, 0.333333, 0.0 }) |got, want| try testing.expectApproxEqAbs(want, got, 1e-6);
+    for (v, [_]f64{ 1.0, 0.9, 0.75, 0.5, 0.25, 0.111111, 0.0 }) |sv, want| try testing.expectApproxEqAbs(want, timeShiftSigma(sv, 12.0, 3.0), 1e-6);
+    const uniform = try knotSigmas(a, &.{ 1.0, 0.75, 0.5, 0.25, 0.0 }, 12.0);
+    defer a.free(uniform);
+    const grid = try sigmaSchedule(a, 4, 12.0);
+    defer a.free(grid);
+    try testing.expectEqualSlices(f64, grid, uniform);
+}
+
+test "minimax h3: a renoise step recovers x0 and lands it on the next noise level with the fresh noise" {
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+    const sh = [_]c_int{4};
+    // x = (1 - σ)·x0 + σ·eps with σ = 0.75; v = eps - x0, the forward's denoise-direction convention.
+    const X0 = [_]f32{ 1, -2, 0.5, 4 };
+    const EPS = [_]f32{ -1, 2, 3, 0 };
+    const FRESH = [_]f32{ 2, 0, -1, 1 };
+    var X: [4]f32 = undefined;
+    var V: [4]f32 = undefined;
+    for (&X, &V, X0, EPS) |*xi, *vi, x0, e| {
+        xi.* = 0.25 * x0 + 0.75 * e;
+        vi.* = e - x0;
+    }
+    const x = mlx.mlx_array_new_data(@ptrCast(&X), &sh, 1, f32t);
+    defer _ = mlx.mlx_array_free(x);
+    const vel = mlx.mlx_array_new_data(@ptrCast(&V), &sh, 1, f32t);
+    defer _ = mlx.mlx_array_free(vel);
+    const fresh = mlx.mlx_array_new_data(@ptrCast(@constCast(&FRESH)), &sh, 1, f32t);
+    defer _ = mlx.mlx_array_free(fresh);
+
+    const next = try renoiseStep(x, vel, 0.75, 0.5, fresh, s);
+    defer _ = mlx.mlx_array_free(next);
+    try mlx.check(mlx.mlx_array_eval(next));
+    for (mlx.mlx_array_data_float32(next).?[0..4], X0, FRESH) |got, x0, n| try testing.expectApproxEqAbs(0.5 * x0 + 0.5 * n, got, 1e-6);
+
+    const last = try renoiseStep(x, vel, 0.75, 0.0, null, s);
+    defer _ = mlx.mlx_array_free(last);
+    try mlx.check(mlx.mlx_array_eval(last));
+    for (mlx.mlx_array_data_float32(last).?[0..4], X0) |got, x0| try testing.expectApproxEqAbs(x0, got, 1e-6);
 }
 
 test "minimax h3: profile ladder arm schedule" {

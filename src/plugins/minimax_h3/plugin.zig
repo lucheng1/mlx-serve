@@ -145,6 +145,25 @@ fn stepsIn(b: *const job.Body, default: u32, lo: u32, hi: u32) ?u32 {
     return if (n < lo or n > hi) null else @intCast(n);
 }
 
+const knots_rule = "'knots' must be 2-101 numbers descending strictly from 1 to 0";
+
+/// Base-grid noise levels, `[1, ..., 0]`; both clocks shift them (Pika H3 Flex's 1000/750/500/250/100/40/0 is
+/// `[1, 0.75, 0.5, 0.25, 0.1, 0.04, 0]`).
+fn parseKnots(b: *const job.Body, buf: *[101]f64) ?[]const f64 {
+    const v = b.get("knots") orelse return null;
+    if (v != .array or v.array.items.len < 2 or v.array.items.len > buf.len) return null;
+    for (v.array.items, 0..) |item, i| {
+        buf[i] = switch (item) {
+            .float => |f| f,
+            .integer => |n| @floatFromInt(n),
+            else => return null,
+        };
+        if (!std.math.isFinite(buf[i]) or (i > 0 and buf[i] >= buf[i - 1])) return null;
+    }
+    const k = buf[0..v.array.items.len];
+    return if (k[0] == 1.0 and k[k.len - 1] == 0.0) k else null;
+}
+
 fn u32Field(b: *const job.Body, key: []const u8, default: u32) u32 {
     return @intCast(@min(b.uint(key) orelse default, std.math.maxInt(u32)));
 }
@@ -357,10 +376,21 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     if (turbo and pdd_steps != null) return bad("'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
     if (turbo and dir.fileBytes("turbo_lora.safetensors") == 0) return bad("this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
+    const renoise = if (b.get("sampler")) |v| blk: {
+        if (v == .string and std.mem.eql(u8, v.string, "renoise")) break :blk true;
+        if (v == .string and std.mem.eql(u8, v.string, "euler")) break :blk false;
+        return bad("'sampler' must be \"euler\" or \"renoise\"");
+    } else false;
+    var knots_buf: [101]f64 = undefined;
+    const knots: ?[]const f64 = if (fieldSet(&b, "knots")) (parseKnots(&b, &knots_buf) orelse return bad(knots_rule)) else null;
+    if ((knots != null or renoise) and pdd_steps != null) return bad("this pack is a distilled student that samples its own trained nodes — omit 'knots' and 'sampler'");
+
     const width = u32Field(&b, "width", 256);
     const height = u32Field(&b, "height", 256);
     const steps = if (pdd_steps) |n|
         stepsIn(&b, n, n, n) orelse return req.refuseFmt(.unsupported, "this pack runs a fixed step count — omit 'steps'", "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n })
+    else if (knots) |k|
+        stepsIn(&b, @intCast(k.len - 1), @intCast(k.len - 1), @intCast(k.len - 1)) orelse return bad("'steps' must match 'knots' (one fewer than the knots) — omit 'steps'")
     else
         stepsIn(&b, if (turbo) 4 else 30, 1, 100) orelse return bad("'steps' must be in [1,100]");
     const seed = b.uint("seed") orelse 0;
@@ -401,7 +431,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     // The request's own activations price the resident plan; when it does not fit, the staged DiT stage is checked
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
-    const distilled = turbo or pdd_steps != null;
+    const distilled = turbo or pdd_steps != null or renoise;
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
     const speed = h3.resolveSpeed(fast, distilled);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
@@ -446,6 +476,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .height = height,
         .frames = requested_frames,
         .steps = steps,
+        .knots = knots,
+        .renoise = renoise,
         .seed = seed,
         .speed = speed,
         .turbo = turbo,
@@ -602,6 +634,27 @@ test "minimax_h3 plugin: a seeded clip on the tiny pack is deterministic JSON me
         .{ "{\"prompt\":\"x\",\"ref_images\":[\"AAAA\"]}", "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint" },
         .{ "{\"prompt\":\"x\",\"turbo\":true}", "this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors" },
         .{ "{\"prompt\":\"x\",\"first_frame_image\":\"!!\"}", "keyframe image is not valid base64" },
+    }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
+}
+
+test "minimax_h3 plugin: 'knots' and the renoise sampler run on the tiny pack; a bad schedule is refused by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack.open(arena.allocator());
+    defer pack.close();
+    const base = "{\"prompt\":\"a red ball rolls\",\"width\":64,\"height\":64,\"num_frames\":5,\"seed\":3,\"fast\":false,";
+    const euler = try arena.allocator().dupe(u8, (try pack.run(base ++ "\"steps\":2}")).ok);
+    try testing.expectEqualStrings(euler, (try pack.run(base ++ "\"knots\":[1,0.5,0]}")).ok);
+    const renoise = try arena.allocator().dupe(u8, (try pack.run(base ++ "\"knots\":[1,0.5,0],\"sampler\":\"renoise\"}")).ok);
+    try testing.expectEqualStrings(renoise, (try pack.run(base ++ "\"knots\":[1,0.5,0],\"sampler\":\"renoise\"}")).ok);
+    try testing.expect(!std.mem.eql(u8, euler, renoise));
+    inline for (.{
+        .{ "{\"prompt\":\"x\",\"sampler\":\"heun\"}", "'sampler' must be \"euler\" or \"renoise\"" },
+        .{ "{\"prompt\":\"x\",\"knots\":[0.9,0]}", knots_rule },
+        .{ "{\"prompt\":\"x\",\"knots\":[1,0.5,0.6,0]}", knots_rule },
+        .{ "{\"prompt\":\"x\",\"knots\":[1]}", knots_rule },
+        .{ "{\"prompt\":\"x\",\"knots\":\"1,0\"}", knots_rule },
+        .{ "{\"prompt\":\"x\",\"knots\":[1,0.5,0],\"steps\":3}", "'steps' must match 'knots' (one fewer than the knots) — omit 'steps'" },
     }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
 }
 
