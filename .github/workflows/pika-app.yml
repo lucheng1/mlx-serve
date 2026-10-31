@@ -1,0 +1,123 @@
+name: Pika app build
+
+# Builds MLX-Serve.app (ad-hoc signed) from this branch, with ddalcu/mlx-serve's latest main merged in first,
+# and uploads it as an artifact. Fork-only: lives on `pika-build`, never on a PR branch.
+#
+#   gh workflow run pika-app.yml -R lucheng1/mlx-serve
+#   gh run download -R lucheng1/mlx-serve -n MLX-Serve-pika
+
+on:
+  workflow_dispatch:
+    inputs:
+      merge_upstream:
+        description: "Merge ddalcu/mlx-serve main before building"
+        type: boolean
+        default: true
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pika-app
+  cancel-in-progress: false
+
+jobs:
+  app:
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      # Registered on the fork's main (schedules and manual runs live there) but always builds pika-build.
+      - uses: actions/checkout@v4
+        with:
+          ref: pika-build
+          fetch-depth: 0
+
+      # Merged in the workspace only (never pushed), so the build always carries upstream's newest main plus the patch.
+      - name: Merge upstream main
+        if: github.event_name == 'schedule' || inputs.merge_upstream
+        run: |
+          git config user.name "pika-build"
+          git config user.email "pika-build@users.noreply.github.com"
+          git remote add upstream https://github.com/ddalcu/mlx-serve.git
+          git fetch --no-tags upstream main
+          git merge --no-edit upstream/main
+
+      - name: Submodules
+        run: git submodule update --init
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Metal toolchain
+        run: |
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+            || sudo xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache Zig toolchain
+        uses: actions/cache@v4
+        with:
+          path: .zig-toolchain
+          key: zig-toolchain-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/fetch-zig.sh') }}
+
+      - name: Install dependencies
+        run: brew bundle install --file=Brewfile
+
+      - name: Compute cache keys
+        id: keys
+        run: |
+          echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
+          echo "submodules=$(git submodule status | shasum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache self-built mlx + mlx-c
+        uses: actions/cache@v4
+        with:
+          path: lib/mlx
+          key: mlx-stage-${{ steps.keys.outputs.mlx }}-${{ steps.keys.outputs.mlxc }}-${{ hashFiles('patches/mlxc-gather-qmm-global-scale.patch') }}-${{ steps.keys.outputs.xcode }}
+
+      - name: Cache Zig build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-cache
+            ~/.cache/zig
+          key: pika-zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.keys.outputs.submodules }}-${{ steps.keys.outputs.xcode }}
+
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: app/.build
+          key: pika-swiftpm-${{ hashFiles('app/Package.resolved', 'scripts/patch-swatex-font-lookup.sh') }}-${{ steps.keys.outputs.xcode }}
+
+      # No APPLE_DEVELOPER_ID on the fork: build.sh signs ad-hoc and skips notarization.
+      - name: Build MLX-Serve.app
+        run: bash app/build.sh
+
+      - name: Smoke test and package
+        run: |
+          APP=app/MLX-Serve.app
+          "$APP/Contents/MacOS/mlx-serve" --version
+          "$APP/Contents/MacOS/mlx-serve" --help | grep -q "w8a8"
+          {
+            echo "branch: ${GITHUB_REF_NAME}"
+            echo "commit: $(git rev-parse HEAD)"
+            echo "upstream: $(git rev-parse upstream/main 2>/dev/null || echo 'not merged')"
+            echo "version: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+            echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            "$APP/Contents/MacOS/mlx-serve" --version
+          } > build-info.txt
+          cat build-info.txt
+          ditto -c -k --keepParent "$APP" MLX-Serve-pika.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MLX-Serve-pika
+          path: |
+            MLX-Serve-pika.zip
+            build-info.txt
+          retention-days: 30
