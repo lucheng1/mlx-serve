@@ -563,6 +563,11 @@ pub const PackedLayout = struct {
     /// vision blocks into the prompt, which is the one case where the text
     /// segment is NOT uniform in modality.
     text_tags: []const u8 = &.{},
+    /// A masked edit: per TARGET video row (packed t, h, w order), true = held to the source and
+    /// modulated as a condition row. BORROWED from the request; empty = every row generates.
+    video_keep: []const bool = &.{},
+    /// A masked edit with the source soundtrack: the whole target audio stream is held to it.
+    audio_keep: bool = false,
     text_len: u32,
     latent_t: u32,
     latent_h: u32,
@@ -1605,12 +1610,38 @@ fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// A contiguous run of rows sharing one AdaLN modulation row.
 pub const ModRun = struct { start: u32, end: u32, mod_row: u32 };
 
+/// Past this many runs (a masked edit cuts the target into thousands) the modulation rows are
+/// gathered once instead of sliced per run: the gather's [S, hidden] beats a graph per run.
+const GATHER_RUNS = 64;
+
+/// `table[row_of(r)]` for every row r: [S, hidden].
+fn gatherModRows(table: mlx.mlx_array, runs: []const ModRun, a: std.mem.Allocator, s: S) !mlx.mlx_array {
+    const idx = try buildRowMod(a, runs[runs.len - 1].end, runs);
+    defer _ = mlx.mlx_array_free(idx);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_take_axis(&out, table, idx, 0, s));
+    return out;
+}
+
 /// `h[a:b] = h[a:b] * (1 + scale[row]) + shift[row]`, applied per run.
 ///
 /// Done by slicing rather than gathering: a gather would materialize
 /// [S, hidden] per modulation tensor (81 MB each at the dev shape, six per
-/// block), while the runs number a handful.
+/// block), while the runs number a handful — until `GATHER_RUNS`.
 fn modScaleShift(h: mlx.mlx_array, shift: mlx.mlx_array, scale: mlx.mlx_array, runs: []const ModRun, a: std.mem.Allocator, s: S) !mlx.mlx_array {
+    if (runs.len > GATHER_RUNS) {
+        const sc = try gatherModRows(scale, runs, a, s);
+        defer _ = mlx.mlx_array_free(sc);
+        const sh = try gatherModRows(shift, runs, a, s);
+        defer _ = mlx.mlx_array_free(sh);
+        const one = try scalarLike(1.0, h, s);
+        defer _ = mlx.mlx_array_free(one);
+        const sc1 = try addA(sc, one, s);
+        defer _ = mlx.mlx_array_free(sc1);
+        const m = try mulA(h, sc1, s);
+        defer _ = mlx.mlx_array_free(m);
+        return addA(m, sh, s);
+    }
     var pieces = try a.alloc(mlx.mlx_array, runs.len);
     defer a.free(pieces);
     var built: usize = 0;
@@ -1642,6 +1673,13 @@ fn modScaleShift(h: mlx.mlx_array, shift: mlx.mlx_array, scale: mlx.mlx_array, r
 
 /// `x[a:b] += other[a:b] * gate[row]`, applied per run.
 fn modGate(x: mlx.mlx_array, gate: mlx.mlx_array, other: mlx.mlx_array, runs: []const ModRun, a: std.mem.Allocator, s: S) !mlx.mlx_array {
+    if (runs.len > GATHER_RUNS) {
+        const g = try gatherModRows(gate, runs, a, s);
+        defer _ = mlx.mlx_array_free(g);
+        const m = try mulA(other, g, s);
+        defer _ = mlx.mlx_array_free(m);
+        return addA(x, m, s);
+    }
     var pieces = try a.alloc(mlx.mlx_array, runs.len);
     defer a.free(pieces);
     var built: usize = 0;
@@ -1744,6 +1782,9 @@ pub const TimestepPlan = struct {
     unique_t: [MAX_UNIQUE_T]f64,
     n_unique: usize,
     runs: []ModRun,
+    /// The timestep rows the final layer modulates the generated video / audio rows with.
+    video_row: u32,
+    audio_row: u32,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *TimestepPlan) void {
@@ -1788,6 +1829,8 @@ pub fn buildTimestepPlan(
         .ref_audio => has_aud_cond = true,
         else => {},
     };
+    if (std.mem.indexOfScalar(bool, layout.video_keep, true) != null) has_vis_cond = true;
+    if (layout.audio_keep) has_aud_cond = true;
     add(&uniq, &n, t_v);
     add(&uniq, &n, t_a);
     if (has_vis_cond) add(&uniq, &n, @max(t_v, aug.visual));
@@ -1802,19 +1845,37 @@ pub fn buildTimestepPlan(
     }.f;
 
     // One run per segment, EXCEPT a text segment carrying vision blocks: those
-    // rows mix modalities, so the reference resolves them into tag runs here.
-    // Sized for the worst case (every text row its own run) and trimmed.
-    const cap = layout.segments.len + layout.text_tags.len;
+    // rows mix modalities, so the reference resolves them into tag runs here,
+    // and an edited target video, whose held rows ride the condition timestep.
+    // Sized for the worst case (every text or target row its own run) and trimmed.
+    const cap = layout.segments.len + layout.text_tags.len + layout.video_keep.len;
     var runs = try allocator.alloc(ModRun, cap);
     errdefer allocator.free(runs);
     var nr: usize = 0;
+    const target = layout.videoSegment();
     for (layout.segments) |seg| {
         const t = switch (seg.kind) {
             .text, .video => t_v,
-            .audio => t_a,
+            .audio => if (layout.audio_keep) @max(t_a, aug.audio) else t_a,
             .cond, .ref_img => @max(t_v, aug.visual),
             .ref_audio => @max(t_a, aug.audio),
         };
+        if (seg.start == target.start and layout.video_keep.len > 0) {
+            if (layout.video_keep.len != seg.end - seg.start) return error.EditMaskRowMismatch;
+            const held = rowOf(uniq[0..n], @max(t_v, aug.visual)) * 3 + seg.kind.modalityTag();
+            const free = rowOf(uniq[0..n], t_v) * 3 + seg.kind.modalityTag();
+            var run_start: u32 = 0;
+            var i: u32 = 1;
+            const keep = layout.video_keep;
+            while (i <= keep.len) : (i += 1) {
+                if (i == keep.len or keep[i] != keep[run_start]) {
+                    runs[nr] = .{ .start = seg.start + run_start, .end = seg.start + i, .mod_row = if (keep[run_start]) held else free };
+                    nr += 1;
+                    run_start = i;
+                }
+            }
+            continue;
+        }
         // Row = t_row * modalities + tag. The `* 3` is the AdaLN reshape's
         // modality stride, not an arbitrary constant.
         const row_base = rowOf(uniq[0..n], t) * 3;
@@ -1839,7 +1900,14 @@ pub fn buildTimestepPlan(
         nr += 1;
     }
     runs = try allocator.realloc(runs, nr);
-    return .{ .unique_t = uniq, .n_unique = n, .runs = runs, .allocator = allocator };
+    return .{
+        .unique_t = uniq,
+        .n_unique = n,
+        .runs = runs,
+        .video_row = rowOf(uniq[0..n], t_v),
+        .audio_row = rowOf(uniq[0..n], if (layout.audio_keep) @max(t_a, aug.audio) else t_a),
+        .allocator = allocator,
+    };
 }
 
 // ── Profiling ablation ──────────────────────────────────────────────────────
@@ -1911,14 +1979,15 @@ pub fn buildTimestepPlanGlobal(
 ) !TimestepPlan {
     var p = try buildTimestepPlan(allocator, layout, sigma_v, shift_v, shift_a, aug);
     errdefer p.deinit();
-    for (p.runs) |*r| {
-        const t = p.unique_t[r.mod_row / 3];
-        const tag = r.mod_row % 3;
-        const gi = for (global_ts, 0..) |g, i| {
-            if (g == t) break i;
-        } else return error.TimestepNotInSchedule;
-        r.mod_row = @as(u32, @intCast(gi)) * 3 + tag;
-    }
+    const globalRow = struct {
+        fn f(table: []const f64, t: f64) !u32 {
+            for (table, 0..) |g, i| if (g == t) return @intCast(i);
+            return error.TimestepNotInSchedule;
+        }
+    }.f;
+    for (p.runs) |*r| r.mod_row = try globalRow(global_ts, p.unique_t[r.mod_row / 3]) * 3 + r.mod_row % 3;
+    p.video_row = try globalRow(global_ts, p.unique_t[p.video_row]);
+    p.audio_row = try globalRow(global_ts, p.unique_t[p.audio_row]);
     return p;
 }
 
@@ -2662,8 +2731,8 @@ pub const Model = struct {
         };
         const vseg = layout.videoSegment();
         const aseg = layout.audioSegment();
-        const v_row = plan.runs[layout.segments.len - 1].mod_row / 3;
-        const a_row = plan.runs[layout.segments.len - 2].mod_row / 3;
+        const v_row = plan.video_row;
+        const a_row = plan.audio_row;
 
         const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, v_row, heads.video_w, heads.video_b, s);
         errdefer _ = mlx.mlx_array_free(vout);
@@ -3534,7 +3603,29 @@ pub const GenRequest = struct {
     /// blocks: a reference has no cond row of its own competing with the tower,
     /// and the prompt addresses it as `<Picture i>` / `<Video k>` / `<Audio j>`.
     refs: []const RefMedia = &.{},
+    /// A masked edit of a source clip (the H3 video-edit latent): held rows stay the source.
+    edit: ?Edit = null,
 };
+
+/// A masked video edit. Held rows enter every forward as conditions (the source at the visual
+/// augmentation, on the condition timestep) and are the exact source in the result; the rest
+/// generate. The step cache and attention broadcast assume one clock per stream, so an edit
+/// runs every step in full.
+pub const Edit = struct {
+    /// [1, 3, F, H, W] in [-1, 1] at the generation canvas, F the snapped frame count.
+    pixels: mlx.mlx_array,
+    /// Per target video row in packed (t, h/2, w/2) order: true = held to the source.
+    keep: []const bool,
+    /// [2, L] source soundtrack at the audio VAE's rate: when set the audio stream is held to it.
+    waveform: ?mlx.mlx_array = null,
+};
+
+/// `where(keep, held, x)` over [rows, C]: an edit's held rows replace the sampler's own.
+pub fn editBlend(x: mlx.mlx_array, held: mlx.mlx_array, keep: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_where(&out, keep, held, x, s));
+    return out;
+}
 
 /// What the audio latent is advanced by this step, per unit of the
 /// slope-scaled velocity the forward returns (`Output.audio` carries
@@ -4080,6 +4171,67 @@ fn generateOne(
         });
     }
 
+    // ── 1.6 a masked edit: the source clip (and soundtrack) as latent rows ──
+    var edit_src: ?mlx.mlx_array = null; // patchified source latent
+    var edit_held: ?mlx.mlx_array = null; // the source as a condition row sees it
+    var edit_keep: ?mlx.mlx_array = null; // [rows, 1] bool
+    var edit_audio: ?mlx.mlx_array = null; // source audio rows
+    defer for ([_]?mlx.mlx_array{ edit_src, edit_held, edit_keep, edit_audio }) |o| if (o) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    if (req.edit) |ed| {
+        if (req.speed.bcast_k > 1 or req.speed.step_cache > 0) return error.EditNeedsFullSteps;
+        const rows: usize = shape.latent_t * (lat_h / PATCH_H) * (lat_w / PATCH_W);
+        if (ed.keep.len != rows) return error.EditMaskRowMismatch;
+        {
+            var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+            defer vw0.deinit();
+            var venc = try vae_mod.Encoder.load(allocator, &vw0, s);
+            defer venc.deinit();
+            const lat = try venc.encodeVideo(ed.pixels, allocator, s);
+            defer _ = mlx.mlx_array_free(lat);
+            if (@as(u32, @intCast(mlx.getShape(lat)[2])) != shape.latent_t) return error.EditLatentDepthMismatch;
+            edit_src = try patchifyVideo(lat, s);
+        }
+        const noise = try randomNormal(mlx.getShape(edit_src.?), req.seed +% 3, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(noise);
+        const aug = try scalarLike(@floatCast(VISUAL_COND_TIMESTEP), edit_src.?, s);
+        defer _ = mlx.mlx_array_free(aug);
+        const one_m = try scalarLike(@floatCast(1.0 - VISUAL_COND_TIMESTEP), edit_src.?, s);
+        defer _ = mlx.mlx_array_free(one_m);
+        const ra = try mulA(edit_src.?, aug, s);
+        defer _ = mlx.mlx_array_free(ra);
+        const na2 = try mulA(noise, one_m, s);
+        defer _ = mlx.mlx_array_free(na2);
+        edit_held = try addA(ra, na2, s);
+        edit_keep = mlx.mlx_array_new_data(ed.keep.ptr, &[_]c_int{ @intCast(rows), 1 }, 2, .bool);
+        if (ed.waveform) |wav| {
+            const apath = paths.audio_vae orelse return error.RefAudioNeedsAudioVae;
+            var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+            defer aw.deinit();
+            const z = try audio_mod.encode(allocator, &aw, wav, s);
+            defer _ = mlx.mlx_array_free(z);
+            const zs = mlx.getShape(z);
+            if (@as(u32, @intCast(zs[3])) < shape.audio_t) return error.EditAudioTooShort;
+            // Cut on the latent's time axis: rows are channel-major, so a row slice would drop a channel.
+            var zcut = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zcut);
+            const start = [_]c_int{ 0, 0, 0, 0 };
+            const stop = [_]c_int{ zs[0], zs[1], zs[2], @intCast(shape.audio_t) };
+            const step = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&zcut, z, &start, 4, &stop, 4, &step, 4, s));
+            edit_audio = try audioLatentToRows(zcut, s);
+        }
+        try mlx.check(mlx.mlx_array_eval(edit_held.?));
+        try mlx.check(mlx.mlx_array_eval(edit_src.?));
+        if (edit_audio) |x| try mlx.check(mlx.mlx_array_eval(x));
+        _ = mlx.mlx_clear_cache();
+        const held = std.mem.count(bool, ed.keep, &.{true});
+        log.info("[minimax-h3] masked edit: {d}/{d} target rows held ({d}% regenerated), audio {s} ({d} ms)\n", .{
+            held, rows, (rows - held) * 100 / @max(rows, 1), if (edit_audio != null) "held" else "generated", phase_timer.lapMs(),
+        });
+    }
+
     if (progress) |p| p.emit("Encoding prompt", 0, req.steps);
 
     // ── 2. presentation: "<Picture i>: " + vision block per keyframe, then the
@@ -4230,6 +4382,10 @@ fn generateOne(
     // BORROWED from `enc`, which outlives the layout. Empty for a pure t2va
     // prompt; non-empty makes the text segment split into modality runs.
     layout.text_tags = enc.tags;
+    if (req.edit) |ed| {
+        layout.video_keep = ed.keep;
+        layout.audio_keep = edit_audio != null;
+    }
 
     const n_video_rows: c_int = @intCast(shape.latent_t * (lat_h / PATCH_H) * (lat_w / PATCH_W));
     const n_audio_rows: c_int = @intCast(shape.audio_t * 2);
@@ -4456,20 +4612,25 @@ fn generateOne(
             // The forward consumes EVERY video-stream row in packed order:
             // constant condition rows first (fl2va keyframes), then the noisy
             // target — the reference's `all_video_rows[~img_update] = cond`.
+            const target_x = if (edit_keep) |k| try editBlend(video_x, edit_held.?, k, s) else video_x;
+            defer if (edit_keep != null) {
+                _ = mlx.mlx_array_free(target_x);
+            };
             const video_in = if (cond_rows) |cr|
-                try concat(&[_]mlx.mlx_array{ cr, video_x }, 0, s)
+                try concat(&[_]mlx.mlx_array{ cr, target_x }, 0, s)
             else
-                video_x;
+                target_x;
             defer if (cond_rows != null) {
                 _ = mlx.mlx_array_free(video_in);
             };
+            const target_a = edit_audio orelse audio_x;
             // Same contract on the AUDIO stream, which only ref2va exercises:
             // the reference audio rows sit at `~audio_update`, ahead of the
             // target's.
             const audio_in = if (audio_cond_rows) |cr|
-                try concat(&[_]mlx.mlx_array{ cr, audio_x }, 0, s)
+                try concat(&[_]mlx.mlx_array{ cr, target_a }, 0, s)
             else
-                audio_x;
+                target_a;
             defer if (audio_cond_rows != null) {
                 _ = mlx.mlx_array_free(audio_in);
             };
@@ -4571,6 +4732,16 @@ fn generateOne(
     }
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] sampling done in {d} ms, DiT released\n", .{phase_timer.lapMs()});
+    if (edit_keep) |k| {
+        const v = try editBlend(video_x, edit_src.?, k, s);
+        _ = mlx.mlx_array_free(video_x);
+        video_x = v;
+    }
+    if (edit_audio) |src| {
+        const a2 = try contig(src, s);
+        _ = mlx.mlx_array_free(audio_x);
+        audio_x = a2;
+    }
 
     // ── 4. VAE decode ──
     // Unpatchify the video rows back to a latent volume: rows are
@@ -6297,6 +6468,110 @@ test "minimax h3: ref2va block layout matches the reference" {
         try testing.expectEqual(SegmentKind.audio, layout.audioSegment().kind);
         try testing.expectEqual(layout.seq_len, layout.videoSegment().end);
     }
+}
+
+test "minimax h3: a masked edit's held rows ride the condition timestep in their own runs" {
+    const a = testing.allocator;
+    var layout = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer layout.deinit();
+    const target = layout.videoSegment();
+    // 8 target rows: held, held, free, free, free, held, free, free.
+    const keep = [_]bool{ true, true, false, false, false, true, false, false };
+    try testing.expectEqual(@as(u32, keep.len), target.end - target.start);
+    layout.video_keep = &keep;
+    layout.audio_keep = true;
+    const sigma = 0.5;
+    var p = try buildTimestepPlan(a, &layout, sigma, 12.0, 3.0, .{});
+    defer p.deinit();
+    const t_v = 1.0 - sigma;
+    // The held rows tile the target exactly, on the condition row; the free ones on the video row.
+    var held: u32 = 0;
+    var cursor = target.start;
+    for (p.runs) |r| {
+        if (r.start < target.start) continue;
+        try testing.expectEqual(cursor, r.start);
+        cursor = r.end;
+        const t = p.unique_t[r.mod_row / 3];
+        try testing.expectEqual(@as(u32, 0), r.mod_row % 3);
+        if (keep[r.start - target.start]) {
+            try testing.expectEqual(VISUAL_COND_TIMESTEP, t);
+            held += r.end - r.start;
+        } else try testing.expectEqual(t_v, t);
+    }
+    try testing.expectEqual(target.end, cursor);
+    try testing.expectEqual(@as(u32, 3), held);
+    // The heads modulate the generated video with t_v; held audio rides the audio condition timestep.
+    try testing.expectEqual(t_v, p.unique_t[p.video_row]);
+    try testing.expectEqual(AUDIO_COND_TIMESTEP, p.unique_t[p.audio_row]);
+    const audio_run = for (p.runs) |r| {
+        if (r.start == layout.audioSegment().start) break r;
+    } else unreachable;
+    try testing.expectEqual(AUDIO_COND_TIMESTEP, p.unique_t[audio_run.mod_row / 3]);
+
+    // A global table resolves the head rows too.
+    const ts = try collectScheduleTs(a, &layout, &.{ 1.0, sigma }, 12.0, 3.0, .{});
+    defer a.free(ts);
+    var g = try buildTimestepPlanGlobal(a, &layout, sigma, 12.0, 3.0, .{}, ts);
+    defer g.deinit();
+    try testing.expectEqual(t_v, ts[g.video_row]);
+    try testing.expectEqual(AUDIO_COND_TIMESTEP, ts[g.audio_row]);
+
+    // A mask that does not cover the target is a named error, never a shifted plan.
+    layout.video_keep = keep[0..7];
+    try testing.expectError(error.EditMaskRowMismatch, buildTimestepPlan(a, &layout, sigma, 12.0, 3.0, .{}));
+}
+
+test "minimax h3: modulation over many runs gathers each row's own shift, scale and gate" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = testing.allocator;
+    const S_ = GATHER_RUNS * 2 + 2;
+    var runs: [S_]ModRun = undefined;
+    for (&runs, 0..) |*r, i| r.* = .{ .start = @intCast(i), .end = @intCast(i + 1), .mod_row = @intCast(i % 3) };
+    var hv: [S_ * 2]f32 = undefined;
+    for (&hv, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i)) * 0.1 - 3.0;
+    const sh = [_]f32{ 0.5, -1, 2, 0.25, -0.5, 1.5 };
+    const sc = [_]f32{ 1, 2, -0.5, 0, 0.25, 3 };
+    const h = mlx.mlx_array_new_data(&hv, &[_]c_int{ S_, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(h);
+    const shift = mlx.mlx_array_new_data(&sh, &[_]c_int{ 3, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(shift);
+    const scale = mlx.mlx_array_new_data(&sc, &[_]c_int{ 3, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+    const m = try modScaleShift(h, shift, scale, &runs, a, s);
+    defer _ = mlx.mlx_array_free(m);
+    const g = try modGate(h, scale, h, &runs, a, s);
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_array_eval(m));
+    try mlx.check(mlx.mlx_array_eval(g));
+    const mo = mlx.mlx_array_data_float32(m).?;
+    const go = mlx.mlx_array_data_float32(g).?;
+    for (0..S_) |r| {
+        for (0..2) |c| {
+            const row = r % 3;
+            const x = hv[r * 2 + c];
+            try testing.expectApproxEqAbs(x * (1 + sc[row * 2 + c]) + sh[row * 2 + c], mo[r * 2 + c], 1e-5);
+            try testing.expectApproxEqAbs(x + x * sc[row * 2 + c], go[r * 2 + c], 1e-5);
+        }
+    }
+}
+
+test "minimax h3: an edit blend takes held rows from the source and the rest from the sampler" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const xv = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const hv = [_]f32{ -1, -2, -3, -4, -5, -6 };
+    const kv = [_]bool{ false, true, false };
+    const x = mlx.mlx_array_new_data(&xv, &[_]c_int{ 3, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    const held = mlx.mlx_array_new_data(&hv, &[_]c_int{ 3, 2 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(held);
+    const keep = mlx.mlx_array_new_data(&kv, &[_]c_int{ 3, 1 }, 2, .bool);
+    defer _ = mlx.mlx_array_free(keep);
+    const out = try editBlend(x, held, keep, s);
+    defer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    try testing.expectEqualSlices(f32, &.{ 1, 2, -3, -4, 5, 6 }, mlx.mlx_array_data_float32(out).?[0..6]);
 }
 
 test "minimax h3: timestep plan assigns modulation rows" {

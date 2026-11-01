@@ -338,6 +338,65 @@ fn references(req: *const abi.Request, b: *const job.Body, gen_w: u32, gen_h: u3
     return null;
 }
 
+const edit_shape = "'edit' must be an object {\"frames\":[…],\"mask\":\"…\",\"audio\":\"…\"}";
+
+/// A masked edit's decoded inputs; `pixels` null = no edit.
+const EditIn = struct {
+    pixels: ?A = null,
+    keep: []bool = &.{},
+    wave: ?A = null,
+
+    fn deinit(e: *EditIn) void {
+        if (e.pixels) |p| _ = mlx.mlx_array_free(p);
+        if (e.wave) |w| _ = mlx.mlx_array_free(w);
+        gpa.free(e.keep);
+    }
+
+    fn request(e: *const EditIn) ?h3.Edit {
+        const px = e.pixels orelse return null;
+        return .{ .pixels = px, .keep = e.keep, .waveform = e.wave };
+    }
+};
+
+/// The `edit` object: the source clip's frames (base64 PNG/JPEG, at least the snapped frame count), its mask as one
+/// byte per target DiT row (base64, packed t x h/32 x w/32; nonzero = regenerate) and an optional WAV soundtrack
+/// the audio stream is held to. Anything unusable is refused by field.
+fn editOf(req: *const abi.Request, b: *const job.Body, width: u32, height: u32, frame_count: u32, s: mlx.mlx_stream, out: *EditIn) !?Verdict {
+    const v = b.get("edit") orelse return null;
+    if (v == .null) return null;
+    if (v != .object) return bad(edit_shape);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fr = v.object.get("frames") orelse return bad(edit_shape);
+    if (fr != .array) return bad(edit_shape);
+    if (fr.array.items.len < frame_count) return req.refuseFmt(.unsupported, "'edit.frames' is shorter than the clip", "'edit.frames' has {d} frames; this clip needs {d}", .{ fr.array.items.len, frame_count });
+    const frames = try a.alloc([]u8, frame_count);
+    for (frames, fr.array.items[0..frame_count], 0..) |*dst, f, i| {
+        if (f != .string) return bad(edit_shape);
+        dst.* = job.imageUpload(a, f.string) catch return req.refuseFmt(.unsupported, "an 'edit.frames' entry is not valid base64", "'edit.frames'[{d}] is not valid base64", .{i});
+    }
+
+    const mask_b64 = (v.object.get("mask") orelse return bad(edit_shape));
+    if (mask_b64 != .string) return bad(edit_shape);
+    const mask = job.base64Decode(a, mask_b64.string) catch return bad("'edit.mask' is not valid base64");
+    const rows = h3.temporalShape(frame_count).latent_t * (height / 32) * (width / 32);
+    if (mask.len != rows) return req.refuseFmt(.unsupported, "'edit.mask' does not match the clip's DiT grid", "'edit.mask' has {d} rows; a {d}x{d} x {d}-frame edit needs {d} (latent frames x h/32 x w/32)", .{ mask.len, width, height, frame_count, rows });
+    if (std.mem.indexOfNone(u8, mask, &.{0}) == null) return bad("'edit.mask' regenerates nothing — every row is held to the source");
+
+    if (v.object.get("audio")) |au| if (au == .string and au.string.len > 0) {
+        const pcm = wav32kStereo(au.string) catch return bad("'edit.audio' must be a PCM16/PCM24/float32 WAV");
+        defer gpa.free(pcm);
+        out.wave = try planar(pcm);
+    };
+    out.keep = try gpa.alloc(bool, rows);
+    for (out.keep, mask) |*k, m| k.* = m == 0;
+    out.pixels = try videoFrames(frames, height, width, 1, 2, s) orelse return bad("an 'edit.frames' entry could not be decoded (PNG/JPEG expected)");
+    log.info("[video] minimax-h3 masked edit engaged ({d} frames, {d} rows)\n", .{ frame_count, rows });
+    return null;
+}
+
 /// Live memory: host RAM (what the OS will grant, and the total) from the request's machine, and the GPU's
 /// working-set room. Unknown host RAM keeps nothing resident and skips the staged-canvas check.
 const Mem = struct { host_avail: u64 = 0, total: u64 = 0, gpu_limit: u64, gpu_active: u64 };
@@ -422,7 +481,13 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const has_refs = fieldSet(&b, "ref_images") or fieldSet(&b, "ref_videos") or fieldSet(&b, "ref_audios");
     if (has_refs and !e.supports_refs) return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
     if (has_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
-    if (e.supports_refs and !e.supports_t2va) {
+    var edit: EditIn = .{};
+    defer edit.deinit();
+    if (fieldSet(&b, "edit")) {
+        if (chain_windows > 1) return bad("an 'edit' covers one clip — omit 'chain_windows'");
+        if (editOf(req, &b, width, height, shape.frame_count, s, &edit) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    }
+    if (e.supports_refs and !e.supports_t2va and edit.pixels == null) {
         const visual = for (refs.items) |m| {
             if (m.ref.kind != .audio) break true;
         } else false;
@@ -433,7 +498,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
     const distilled = turbo or pdd_steps != null or renoise;
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
-    const speed = h3.resolveSpeed(fast, distilled);
+    // An edit holds rows to another clock, which the velocity cache and the attention broadcast cannot follow.
+    const speed = h3.resolveSpeed(fast, distilled or edit.pixels != null);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
     const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n));
     const activations = config.activationBytes(rows, bcast_row);
@@ -488,12 +554,14 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .chain_windows = chain_windows,
         .keyframes = kfs.buf[0..kfs.n],
         .refs = refs.items,
+        .edit = edit.request(),
     }, job.progressOf(progress), s) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         // The LoRA failures are the user's to fix, each with its own remedy.
         error.LoraNoMatch => bad("a LoRA has no modules matching MiniMax-H3's DiT — wrong architecture for this adapter?"),
         error.BadLoraPath => bad("'lora_paths' must be absolute paths to .safetensors files"),
         error.TooManyLoras => bad("too many LoRA adapters (max 8, and turbo takes one of the slots)"),
+        error.EditAudioTooShort => bad("'edit.audio' is shorter than the clip"),
         error.TurboLoraIncomplete => bad("turbo_lora.safetensors ships modules MiniMax-H3's DiT does not have — replace it with minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora"),
         else => job.failure(err, "MiniMax-H3 generation failed"),
     };
@@ -655,6 +723,25 @@ test "minimax_h3 plugin: 'knots' and the renoise sampler run on the tiny pack; a
         .{ "{\"prompt\":\"x\",\"knots\":[1]}", knots_rule },
         .{ "{\"prompt\":\"x\",\"knots\":\"1,0\"}", knots_rule },
         .{ "{\"prompt\":\"x\",\"knots\":[1,0.5,0],\"steps\":3}", "'steps' must match 'knots' (one fewer than the knots) — omit 'steps'" },
+    }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
+}
+
+test "minimax_h3 plugin: an unusable 'edit' is refused by field before anything loads" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack.open(arena.allocator());
+    defer pack.close();
+    const base = "{\"prompt\":\"x\",\"width\":64,\"height\":64,\"num_frames\":5,";
+    const five = "\"frames\":[\"QUJD\",\"QUJD\",\"QUJD\",\"QUJD\",\"QUJD\"]";
+    inline for (.{
+        .{ base ++ "\"edit\":3}", edit_shape },
+        .{ base ++ "\"edit\":{\"mask\":\"AAAA\"}}", edit_shape },
+        .{ base ++ "\"edit\":{\"frames\":[\"QUJD\"],\"mask\":\"AAAA\"}}", "'edit.frames' has 1 frames; this clip needs 5" },
+        .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AAAA\"}}", "'edit.mask' has 3 rows; a 64x64 x 5-frame edit needs 8 (latent frames x h/32 x w/32)" },
+        .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AAAAAAAAAAA=\"}}", "'edit.mask' regenerates nothing — every row is held to the source" },
+        .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\",\"audio\":\"QUJD\"}}", "'edit.audio' must be a PCM16/PCM24/float32 WAV" },
+        .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\"}}", "an 'edit.frames' entry could not be decoded (PNG/JPEG expected)" },
+        .{ base ++ "\"chain_windows\":2,\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\"}}", "an 'edit' covers one clip — omit 'chain_windows'" },
     }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
 }
 
