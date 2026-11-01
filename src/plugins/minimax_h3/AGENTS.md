@@ -23,6 +23,8 @@ a student runs exactly its own), `seed`, `turbo` (needs `turbo_lora.safetensors`
 `knots` (2-101 base-grid levels from 1 to 0; sets `steps`) and `sampler` `euler`|`renoise` (not on a student).
 `edit` `{frames, mask, audio?}`: a masked edit (one mask byte per target row, nonzero = regenerate); held rows ride the
 condition timestep and come back as the exact source; the fast recipe is off for edits.
+`guide` `{frames}`: an aligned clip anchored at frame 0 (ComfyUI's AddGuide; cropped to the ladder and the clip),
+condition rows on the target's own grid and timeline after the refs.
 `cfg_scale`/`stg_scale`/`pipeline` are ignored, not refused (the app sends them for every video backend).
 
 ## Rules
