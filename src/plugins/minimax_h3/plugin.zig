@@ -397,6 +397,31 @@ fn editOf(req: *const abi.Request, b: *const job.Body, width: u32, height: u32, 
     return null;
 }
 
+const guide_shape = "'guide' must be an object {\"frames\":[…]} of at least 5 base64 PNG/JPEG frames";
+
+/// The `guide` object: an aligned clip anchored at frame 0 (ComfyUI's AddGuide), cropped like it to the 17k+5 ladder
+/// and to the clip, decoded at the canvas. Null pixels = no guide.
+fn guideOf(req: *const abi.Request, b: *const job.Body, width: u32, height: u32, frame_count: u32, s: mlx.mlx_stream, out: *?A) !?Verdict {
+    const v = b.get("guide") orelse return null;
+    if (v == .null) return null;
+    if (v != .object) return bad(guide_shape);
+    const fr = v.object.get("frames") orelse return bad(guide_shape);
+    if (fr != .array or fr.array.items.len < 5) return bad(guide_shape);
+    var n: usize = @min(fr.array.items.len, frame_count);
+    while (n % 17 != 5) n -= 1;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const frames = try a.alloc([]u8, n);
+    for (frames, fr.array.items[0..n], 0..) |*dst, f, i| {
+        if (f != .string) return bad(guide_shape);
+        dst.* = job.imageUpload(a, f.string) catch return req.refuseFmt(.unsupported, "a 'guide.frames' entry is not valid base64", "'guide.frames'[{d}] is not valid base64", .{i});
+    }
+    out.* = try videoFrames(frames, height, width, 1, 2, s) orelse return bad("a 'guide.frames' entry could not be decoded (PNG/JPEG expected)");
+    log.info("[video] minimax-h3 aligned guide engaged ({d} of {d} frames)\n", .{ n, frame_count });
+    return null;
+}
+
 /// Live memory: host RAM (what the OS will grant, and the total) from the request's machine, and the GPU's
 /// working-set room. Unknown host RAM keeps nothing resident and skips the staged-canvas check.
 const Mem = struct { host_avail: u64 = 0, total: u64 = 0, gpu_limit: u64, gpu_active: u64 };
@@ -481,13 +506,21 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const has_refs = fieldSet(&b, "ref_images") or fieldSet(&b, "ref_videos") or fieldSet(&b, "ref_audios");
     if (has_refs and !e.supports_refs) return bad("this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
     if (has_refs) if (references(req, &b, width, height, shape.frame_count, s, &refs) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    var guide: ?A = null;
+    defer if (guide) |g| {
+        _ = mlx.mlx_array_free(g);
+    };
+    if (fieldSet(&b, "guide")) {
+        if (chain_windows > 1) return bad("a 'guide' covers one clip — omit 'chain_windows'");
+        if (guideOf(req, &b, width, height, shape.frame_count, s, &guide) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
+    }
     var edit: EditIn = .{};
     defer edit.deinit();
     if (fieldSet(&b, "edit")) {
         if (chain_windows > 1) return bad("an 'edit' covers one clip — omit 'chain_windows'");
         if (editOf(req, &b, width, height, shape.frame_count, s, &edit) catch |err| return job.failure(err, "MiniMax-H3 generation failed")) |v| return v;
     }
-    if (e.supports_refs and !e.supports_t2va and edit.pixels == null) {
+    if (e.supports_refs and !e.supports_t2va and edit.pixels == null and guide == null) {
         const visual = for (refs.items) |m| {
             if (m.ref.kind != .audio) break true;
         } else false;
@@ -501,7 +534,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     // An edit holds rows to another clock, which the velocity cache and the attention broadcast cannot follow.
     const speed = h3.resolveSpeed(fast, distilled or edit.pixels != null);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
-    const rows = config.requestRows(width, height, shape.frame_count, @intCast(kfs.n));
+    const guide_t: u32 = if (guide) |g| h3.videoLatentT(@intCast(mlx.getShape(g)[2])) else 0;
+    const rows = config.requestRows(width, height, shape.frame_count, @as(u32, @intCast(kfs.n)) + guide_t);
     const activations = config.activationBytes(rows, bcast_row);
     const mem = memNow(req);
     const plan = residentFor(e, dir, activations, mem);
@@ -555,6 +589,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .keyframes = kfs.buf[0..kfs.n],
         .refs = refs.items,
         .edit = edit.request(),
+        .guide = guide,
     }, job.progressOf(progress), s) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         // The LoRA failures are the user's to fix, each with its own remedy.
@@ -742,6 +777,22 @@ test "minimax_h3 plugin: an unusable 'edit' is refused by field before anything 
         .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\",\"audio\":\"QUJD\"}}", "'edit.audio' must be a PCM16/PCM24/float32 WAV" },
         .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\"}}", "an 'edit.frames' entry could not be decoded (PNG/JPEG expected)" },
         .{ base ++ "\"chain_windows\":2,\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\"}}", "an 'edit' covers one clip — omit 'chain_windows'" },
+    }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
+}
+
+test "minimax_h3 plugin: an unusable 'guide' is refused by field before anything loads" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var pack = try MediaPack.open(arena.allocator());
+    defer pack.close();
+    const base = "{\"prompt\":\"x\",\"width\":64,\"height\":64,\"num_frames\":5,";
+    const five = "\"frames\":[\"QUJD\",\"QUJD\",\"QUJD\",\"QUJD\",\"QUJD\"]";
+    inline for (.{
+        .{ base ++ "\"guide\":3}", guide_shape },
+        .{ base ++ "\"guide\":{\"frames\":[\"QUJD\"]}}", guide_shape },
+        .{ base ++ "\"guide\":{\"frames\":[\"QUJD\",\"QUJD\",\"QUJD\",\"QUJD\",1]}}", guide_shape },
+        .{ base ++ "\"guide\":{" ++ five ++ "}}", "a 'guide.frames' entry could not be decoded (PNG/JPEG expected)" },
+        .{ base ++ "\"chain_windows\":2,\"guide\":{" ++ five ++ "}}", "a 'guide' covers one clip — omit 'chain_windows'" },
     }) |c| try testing.expectEqualStrings(c[1], (try pack.run(c[0])).refused.why.slice());
 }
 

@@ -584,7 +584,7 @@ pub const PackedLayout = struct {
         keyframes: []const KeyframeAnchor,
         frame_count: u32,
     ) !PackedLayout {
-        return initFull(allocator, text_len, latent_t, latent_h, latent_w, audio_t, keyframes, frame_count, &.{});
+        return initFull(allocator, text_len, latent_t, latent_h, latent_w, audio_t, keyframes, frame_count, &.{}, 0);
     }
 
     pub fn initFull(
@@ -597,6 +597,8 @@ pub const PackedLayout = struct {
         keyframes: []const KeyframeAnchor,
         frame_count: u32,
         refs: []const RefBlock,
+        /// Latent frames of an aligned guide clip anchored at frame 0 (ComfyUI's AddGuide); 0 = none.
+        guide_t: u32,
     ) !PackedLayout {
         const area = @sqrt(@as(f64, @floatFromInt(latent_h)) * @as(f64, @floatFromInt(latent_w)));
         const h_axis = try axisFromSqrtArea(allocator, latent_h, PATCH_H, area);
@@ -637,13 +639,15 @@ pub const PackedLayout = struct {
             }
         }
 
-        const seq_len = text_len + n_cond * frame_rows + ref_img_rows + ref_audio_rows + n_audio_rows + n_video_rows;
+        if (guide_t > latent_t) return error.GuideLongerThanClip;
+        const n_guide_rows = guide_t * frame_rows;
+        const seq_len = text_len + n_cond * frame_rows + n_guide_rows + ref_img_rows + ref_audio_rows + n_audio_rows + n_video_rows;
 
-        var segments = try std.ArrayList(Segment).initCapacity(allocator, 3 + n_cond + ref_segments);
+        var segments = try std.ArrayList(Segment).initCapacity(allocator, 4 + n_cond + ref_segments);
         errdefer segments.deinit(allocator);
         const position_ids = try allocator.alloc(f64, @as(usize, seq_len) * 3);
         errdefer allocator.free(position_ids);
-        const img_update = try allocator.alloc(bool, n_cond * frame_rows + ref_img_rows + n_video_rows);
+        const img_update = try allocator.alloc(bool, n_cond * frame_rows + n_guide_rows + ref_img_rows + n_video_rows);
         errdefer allocator.free(img_update);
         const audio_update = try allocator.alloc(bool, ref_audio_rows + n_audio_rows);
         errdefer allocator.free(audio_update);
@@ -684,6 +688,30 @@ pub const PackedLayout = struct {
             row += frame_rows;
         }
         _ = frame_count; // only the anchor matters; kept for call-site symmetry
+
+        // An aligned guide clip: condition rows on the TARGET's own spatial grid and timeline, which starts after
+        // every reference block (the reference's `cond_t = cursor + FRAME_RESCALE * frame_idx`, cursor past the refs).
+        if (guide_t > 0) {
+            var origin = cursor;
+            for (refs) |b| origin += switch (b.kind) {
+                .image => 1.0,
+                .audio => @as(f64, @floatFromInt(b.audio_t)),
+                .video => blk: {
+                    var spans: f64 = 0;
+                    for (0..b.latent_t) |k| spans += videoTSpan(k);
+                    break :blk @max(@as(f64, @floatFromInt(b.audio_t)), spans);
+                },
+            };
+            try segments.append(allocator, .{ .start = row, .end = row + n_guide_rows, .kind = .cond, .grid = .{ guide_t, @intCast(h_axis.len), @intCast(w_axis.len) } });
+            const g_grid = try videoTGrid(allocator, guide_t, origin);
+            defer allocator.free(g_grid);
+            for (g_grid, 0..) |tv, f| writeFrameGrid(position_ids, row + @as(u32, @intCast(f)) * frame_rows, tv, h_axis, w_axis);
+            for (0..n_guide_rows) |_| {
+                img_update[img_row] = false;
+                img_row += 1;
+            }
+            row += n_guide_rows;
+        }
 
         // ref2va blocks, in request order. Each ADVANCES THE CURSOR by its own
         // amount, so the target streams start after everything the references
@@ -3605,6 +3633,9 @@ pub const GenRequest = struct {
     refs: []const RefMedia = &.{},
     /// A masked edit of a source clip (the H3 video-edit latent): held rows stay the source.
     edit: ?Edit = null,
+    /// An aligned guide clip anchored at frame 0 (ComfyUI's AddGuide, what the LMS detail LoRA is trained on):
+    /// [1, 3, F, H, W] in [-1, 1] at the generation canvas, F on the 17k+5 ladder and at most the clip's.
+    guide: ?mlx.mlx_array = null,
 };
 
 /// A masked video edit. Held rows enter every forward as conditions (the source at the visual
@@ -4070,9 +4101,10 @@ fn generateOne(
     defer allocator.free(ref_blocks);
     for (req.refs, 0..) |m, i| ref_blocks[i] = refBlockFor(m.ref);
 
+    const guide_t: u32 = if (req.guide) |g| videoLatentT(@intCast(mlx.getShape(g)[2])) else 0;
     var anchors_buf: [2]KeyframeAnchor = undefined;
     var anchors: []const KeyframeAnchor = &.{};
-    if (req.keyframes.len > 0 or req.refs.len > 0) {
+    if (req.keyframes.len > 0 or req.refs.len > 0 or req.guide != null) {
         if (req.keyframes.len > 2) return error.TooManyKeyframes;
         var rows_list: std.ArrayList(mlx.mlx_array) = .empty;
         defer {
@@ -4085,7 +4117,7 @@ fn generateOne(
             arows_list.deinit(allocator);
         }
 
-        var needs_visual = req.keyframes.len > 0;
+        var needs_visual = req.keyframes.len > 0 or req.guide != null;
         var needs_audio = false;
         for (req.refs) |m| {
             if (m.ref.kind != .audio) needs_visual = true;
@@ -4104,6 +4136,12 @@ fn generateOne(
                 try rows_list.append(allocator, try patchifyVideo(lat, s));
             }
             anchors = anchors_buf[0..req.keyframes.len];
+            if (req.guide) |g| {
+                const lat = try enc.encodeVideo(g, allocator, s);
+                defer _ = mlx.mlx_array_free(lat);
+                if (@as(u32, @intCast(mlx.getShape(lat)[2])) != guide_t) return error.GuideLatentDepthMismatch;
+                try rows_list.append(allocator, try patchifyVideo(lat, s));
+            }
             for (req.refs) |m| {
                 if (m.ref.kind == .audio) continue;
                 const px = m.pixels orelse return error.RefMissingPixels;
@@ -4162,8 +4200,9 @@ fn generateOne(
             try mlx.check(mlx.mlx_array_eval(cond_rows.?));
         }
         _ = mlx.mlx_clear_cache();
-        log.info("[minimax-h3] {d} keyframe(s) + {d} reference(s) encoded -> {d} visual / {d} audio cond rows ({d} ms, encoders released)\n", .{
+        log.info("[minimax-h3] {d} keyframe(s) + {d} guide latent frames + {d} reference(s) encoded -> {d} visual / {d} audio cond rows ({d} ms, encoders released)\n", .{
             req.keyframes.len,
+            guide_t,
             req.refs.len,
             if (cond_rows) |cr| mlx.getShape(cr)[0] else 0,
             if (audio_cond_rows) |cr| mlx.getShape(cr)[0] else 0,
@@ -4377,7 +4416,7 @@ fn generateOne(
     });
 
     // ── 4. DiT sampling ──
-    var layout = try PackedLayout.initFull(allocator, te_len, shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count, ref_blocks);
+    var layout = try PackedLayout.initFull(allocator, te_len, shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count, ref_blocks, guide_t);
     defer layout.deinit();
     // BORROWED from `enc`, which outlives the layout. Empty for a pure t2va
     // prompt; non-empty makes the text segment split into modality runs.
@@ -6191,7 +6230,7 @@ test "minimax h3: ref2va request resolution orders and numbers references" {
 
     // And the layout built from them is well-formed: the target streams stay
     // last, and every reference row is a CONDITION row.
-    var layout = try PackedLayout.initFull(a, 64, 17, 30, 54, 93, &.{}, 56, res.blocks);
+    var layout = try PackedLayout.initFull(a, 64, 17, 30, 54, 93, &.{}, 56, res.blocks, 0);
     defer layout.deinit();
     try testing.expectEqual(SegmentKind.video, layout.videoSegment().kind);
     try testing.expectEqual(SegmentKind.audio, layout.audioSegment().kind);
@@ -6310,7 +6349,7 @@ test "h3 vsa: the packed layout hands VSA every segment in order, video segments
         .{ .kind = .image, .latent_h = 4, .latent_w = 4 },
         .{ .kind = .video, .latent_h = 4, .latent_w = 8, .latent_t = 2, .audio_t = 3 },
     };
-    var lay = try PackedLayout.initFull(a, 10, 3, 8, 12, 4, &.{}, 9, &refs);
+    var lay = try PackedLayout.initFull(a, 10, 3, 8, 12, 4, &.{}, 9, &refs, 0);
     defer lay.deinit();
     const segs = try lay.vsaSegments(a);
     defer a.free(segs);
@@ -6375,6 +6414,7 @@ test "minimax h3: ref2va block layout matches the reference" {
             &.{},
             jsonU32(o.get("frame_count").?),
             refs,
+            0,
         );
         defer layout.deinit();
 
@@ -6519,6 +6559,27 @@ test "minimax h3: a masked edit's held rows ride the condition timestep in their
     // A mask that does not cover the target is a named error, never a shifted plan.
     layout.video_keep = keep[0..7];
     try testing.expectError(error.EditMaskRowMismatch, buildTimestepPlan(a, &layout, sigma, 12.0, 3.0, .{}));
+}
+
+test "minimax h3: an aligned guide clip packs as condition rows on the target's own timeline, after the refs" {
+    const a = testing.allocator;
+    // One image reference (cursor +1), a 2-latent-frame guide on a 2-latent-frame clip.
+    const refs = [_]RefBlock{.{ .kind = .image, .latent_h = 4, .latent_w = 4 }};
+    var lay = try PackedLayout.initFull(a, 6, 2, 4, 4, 3, &.{}, 5, &refs, 2);
+    defer lay.deinit();
+    const frame_rows: u32 = 4; // (4/2) x (4/2)
+    const guide = lay.segments[1];
+    try testing.expectEqual(SegmentKind.cond, guide.kind);
+    try testing.expectEqual(@as(u32, 6), guide.start);
+    try testing.expectEqual(@as(u32, 2 * frame_rows), guide.end - guide.start);
+    const target = lay.videoSegment();
+    // Row by row the guide sits exactly where the target does: same t, h, w.
+    for (0..guide.end - guide.start) |r| {
+        for (0..3) |c| try testing.expectEqual(lay.position_ids[(target.start + r) * 3 + c], lay.position_ids[(guide.start + r) * 3 + c]);
+    }
+    // Guide rows are conditions, never denoised.
+    for (lay.img_update[0 .. 2 * frame_rows]) |u| try testing.expect(!u);
+    try testing.expectError(error.GuideLongerThanClip, PackedLayout.initFull(a, 6, 2, 4, 4, 3, &.{}, 5, &refs, 7));
 }
 
 test "minimax h3: modulation over many runs gathers each row's own shift, scale and gate" {
