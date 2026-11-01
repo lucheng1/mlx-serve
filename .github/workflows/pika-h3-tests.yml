@@ -12,6 +12,13 @@ on:
       filter:
         description: "Test-name filter"
         default: "minimax"
+      ref:
+        description: "Branch to test"
+        default: "pika-build"
+      stage_mlx:
+        description: "Upload the built lib/mlx (headers + libs) as an artifact for local type checks"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: pika-build
+          ref: ${{ inputs.ref }}
           submodules: true
 
       - name: Select Xcode
@@ -63,6 +70,17 @@ jobs:
 
       - name: Build mlx + mlx-c
         run: bash scripts/build-mlx.sh
+
+      - name: Upload the mlx stage
+        if: inputs.stage_mlx
+        run: tar -czf mlx-stage.tgz lib/mlx
+
+      - if: inputs.stage_mlx
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlx-stage
+          path: mlx-stage.tgz
+          retention-days: 7
 
       - name: Fetch libllama
         run: bash scripts/fetch-llama.sh

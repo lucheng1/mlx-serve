@@ -13,6 +13,9 @@ on:
         description: "Merge ddalcu/mlx-serve main before building"
         type: boolean
         default: true
+      ref:
+        description: "Branch to build"
+        default: "pika-build"
   schedule:
     # Days 1, 7, 13, 19, 25, 31 at 09:00 UTC: never more than 6 days apart, inside GitHub's 7-day cache eviction.
     - cron: "0 9 */6 * *"
@@ -32,7 +35,7 @@ jobs:
       # Registered on the fork's main (schedules and manual runs live there) but always builds pika-build.
       - uses: actions/checkout@v4
         with:
-          ref: pika-build
+          ref: ${{ inputs.ref || 'pika-build' }}
           fetch-depth: 0
 
       # Merged in the workspace only (never pushed), so the build always carries upstream's newest main plus the patch.
