@@ -4204,7 +4204,7 @@ fn generateOne(
         const na2 = try mulA(noise, one_m, s);
         defer _ = mlx.mlx_array_free(na2);
         edit_held = try addA(ra, na2, s);
-        edit_keep = mlx.mlx_array_new_data(ed.keep.ptr, &[_]c_int{ @intCast(rows), 1 }, 2, .bool);
+        edit_keep = mlx.mlx_array_new_data(ed.keep.ptr, &[_]c_int{ @intCast(rows), 1 }, 2, .bool_);
         if (ed.waveform) |wav| {
             const apath = paths.audio_vae orelse return error.RefAudioNeedsAudioVae;
             var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
@@ -6566,7 +6566,7 @@ test "minimax h3: an edit blend takes held rows from the source and the rest fro
     defer _ = mlx.mlx_array_free(x);
     const held = mlx.mlx_array_new_data(&hv, &[_]c_int{ 3, 2 }, 2, .float32);
     defer _ = mlx.mlx_array_free(held);
-    const keep = mlx.mlx_array_new_data(&kv, &[_]c_int{ 3, 1 }, 2, .bool);
+    const keep = mlx.mlx_array_new_data(&kv, &[_]c_int{ 3, 1 }, 2, .bool_);
     defer _ = mlx.mlx_array_free(keep);
     const out = try editBlend(x, held, keep, s);
     defer _ = mlx.mlx_array_free(out);

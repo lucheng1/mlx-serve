@@ -736,8 +736,8 @@ test "minimax_h3 plugin: an unusable 'edit' is refused by field before anything 
     inline for (.{
         .{ base ++ "\"edit\":3}", edit_shape },
         .{ base ++ "\"edit\":{\"mask\":\"AAAA\"}}", edit_shape },
-        .{ base ++ "\"edit\":{\"frames\":[\"QUJD\"],\"mask\":\"AAAA\"}}", "'edit.frames' has 1 frames; this clip needs 5" },
-        .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AAAA\"}}", "'edit.mask' has 3 rows; a 64x64 x 5-frame edit needs 8 (latent frames x h/32 x w/32)" },
+        .{ base ++ "\"edit\":{\"frames\":[\"QUJD\"],\"mask\":\"AAAA\"}}", "'edit.frames' is shorter than the clip" },
+        .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AAAA\"}}", "'edit.mask' does not match the clip's DiT grid" },
         .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AAAAAAAAAAA=\"}}", "'edit.mask' regenerates nothing — every row is held to the source" },
         .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\",\"audio\":\"QUJD\"}}", "'edit.audio' must be a PCM16/PCM24/float32 WAV" },
         .{ base ++ "\"edit\":{" ++ five ++ ",\"mask\":\"AQEBAQEBAQE=\"}}", "an 'edit.frames' entry could not be decoded (PNG/JPEG expected)" },
